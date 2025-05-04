@@ -13,10 +13,9 @@ use capstone::prelude::*;
 use goblin::elf::program_header::ProgramHeader;
 use goblin::elf::sym::STT_FUNC;
 use serde::Serialize;
+use regex::Regex;
 
-const UPACKAGE_SCRIPT_COMMONSOURCE: u64 = 0x09ac3d8c;
 //_Z39Z_Construct_UScriptStruct_FBaseProtocolv
-const FBASE_PROTOCOL: u64 = 0x09bce1dc;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum FieldType {
@@ -387,6 +386,35 @@ fn arm64_store_imm(mem: &Mem, addr: u64) -> anyhow::Result<u32> {
     }
 }
 
+use std::sync::OnceLock;
+fn clean_uobject_sym(sym: &str) -> String {
+    // Compile lazily so we pay the cost only once.
+    // Regex:  _Z\d+Z_Construct_U(ScriptStruct|Enum)_([^_]+_)?([A-Za-z0-9]+)v
+    static RE_STRUCT: OnceLock<Regex> = OnceLock::new();
+    static RE_ENUM:   OnceLock<Regex> = OnceLock::new();
+
+    let struct_re = RE_STRUCT.get_or_init(|| {
+        // _ZxxZ_Construct_UScriptStruct_<anything>v   →  capture 1 = full thing
+        Regex::new(r"^_Z\d+Z_Construct_UScriptStruct_([A-Za-z0-9_]+)v$")
+            .expect("struct regex")
+    });
+    if let Some(caps) = struct_re.captures(sym) {
+        return caps[1].to_owned();
+    }
+
+    let enum_re = RE_ENUM.get_or_init(|| {
+        // _ZxxZ_Construct_UEnum_<pkg>_<EnumName>v      →  capture 1 = EnumName
+        Regex::new(r"^_Z\d+Z_Construct_UEnum_[A-Za-z0-9]+_([A-Za-z0-9]+)v$")
+            .expect("enum regex")
+    });
+    if let Some(caps) = enum_re.captures(sym) {
+        return caps[1].to_owned();
+    }
+
+    // fallback – return original string unchanged
+    sym.to_owned()
+}
+
 fn read_field(mem: &Mem, field_addr: u64) -> anyhow::Result<Field> {
     // field record is always 0x38 bytes
     let rec = mem.read_bytes(field_addr, 0x38)?;
@@ -405,32 +433,32 @@ fn read_field(mem: &Mem, field_addr: u64) -> anyhow::Result<Field> {
 
     let name = mem.get_ascii_string(s_name)?;
 
-    let (offset, ty_ptr) = match f_type {
-        25 | 30 => {
-            // type = MetaData.funcdesc(...)
-            // Here we just read the pointee; swap in a real parser later.
+    let (offset, ty_name_opt) = match f_type {
+            25 | 30 => {
+                // look up symbol → clean it
+                let ty_name = mem
+                    .addr2name
+                    .get(&func_desc)
+                    .clone()
+                    ;
+                (raw_offset, ty_name)
+            }
+            44 => {
+                let off = arm64_store_imm(mem, func_desc1 + 4).unwrap_or(0);
+                (off, None)
+            }
+            _ => (raw_offset, None),
+        };
 
-            let sub_name = mem.addr2name.get(&func_desc);
+    let f_type = to_field_type(f_type, ty_name_opt.cloned());
 
-            (raw_offset, sub_name)
-        }
-        44 => {
-            // offset = MetaData.funcdesc_44(...)
-            let off = arm64_store_imm(mem, func_desc1 + 4).unwrap_or(0);
-            (off, None)
-        }
-        _ => (raw_offset, None),
-    };
-
-    let f_type = to_field_type(f_type, ty_ptr.cloned());
-
-    let ty_ptr = ty_ptr.cloned();
+    let ty_ptr = ty_name_opt.clone();
 
     Ok(Field {
         name,
         f_type,
         offset,
-        ty_ptr,
+        ty_ptr: ty_ptr.cloned(),
         unk1,
         unk2,
         unk3,
@@ -591,29 +619,55 @@ fn elixir_atom(src: &str) -> String {
     out
 }
 
-fn generate_elixir(packets: &[PacketInfo], space: &str) -> String {
-    let mut buf = String::with_capacity(4096);
-    buf.push_str("# Auto-generated: DO NOT EDIT\n");
-    buf.push_str(&format!("defmodule {} do\n\n", space));
+fn elixir_type(ft: &FieldType) -> String {
+    use FieldType::*;
+    match ft {
+        U8            => ":u8".into(),
+        I32           => ":i32".into(),
+        I64           => ":i64".into(),
+        F32           => ":f32".into(),
+        StringUtf16   => ":string_utf16".into(),
+        Bool          => ":bool".into(),
 
+        Array(elem)   => format!("list({})", elixir_type(elem)),
+        Struct(raw)  => format!("PacketDSL.struct({})", clean_uobject_sym(raw)),
+        Enum { name, .. } => format!("PacketDSL.enum({})", clean_uobject_sym(name)),
+
+        Unresolved    => ":unresolved".into(),
+        Unknown(code) => format!("PacketDSL.unknown({})", code),
+    }
+}
+
+/// Generate Elixir code that uses PacketDSL.
+fn generate_elixir(packets: &[PacketInfo], module_name: &str) -> String {
+    let mut out = String::with_capacity(4096);
+
+    // ── header ───────────────────────────────────────────────────────────
+    writeln!(out, "# Auto-generated: DO NOT EDIT").unwrap();
+    writeln!(out, "defmodule {} do", module_name).unwrap();
+    writeln!(out, "  import PacketDSL\n").unwrap();
+
+    // ── every packet ─────────────────────────────────────────────────────
     for pkt in packets {
-        buf.push_str(&format!("  defmodule {} do\n", pkt.name));
-        buf.push_str("    @enforce_keys []\n");
-        buf.push_str("    defstruct [\n");
+        writeln!(out, "  packet {} do", pkt.name).unwrap();
 
         for f in &pkt.fields {
+            let fname = elixir_atom(&f.name);
+            let ftype = elixir_type(&f.f_type);
             writeln!(
-                &mut buf,
-                "      :{},  # offset 0x{:X}",
-                elixir_atom(&f.name),
+                out,
+                "    field :{:<20}, {:<25} # offset 0x{:X}",
+                fname,
+                ftype,
                 f.offset
             )
             .unwrap();
         }
 
-        buf.push_str("    ]\n  end\n\n");
+        writeln!(out, "  end\n").unwrap();
     }
 
-    buf.push_str("end\n");
-    buf
+    // ── footer ───────────────────────────────────────────────────────────
+    out.push_str("end\n");
+    out
 }
