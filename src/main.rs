@@ -12,8 +12,9 @@ use capstone::arch::arm64::Arm64OperandType;
 use capstone::prelude::*;
 use goblin::elf::program_header::ProgramHeader;
 use goblin::elf::sym::STT_FUNC;
-use serde::Serialize;
 use regex::Regex;
+use serde::Serialize;
+use std::fs;
 
 //_Z39Z_Construct_UScriptStruct_FBaseProtocolv
 
@@ -201,12 +202,19 @@ fn build_symbol_maps(elf: &Elf) -> (HashMap<u64, String>, HashMap<String, u64>) 
 fn read_packet(mem: &Mem, entry: u64) -> Result<(u64, PacketInfo), anyhow::Error> {
     let rec = mem.read_bytes(entry, 72)?;
     let s_name = mem.get_ascii_string(LittleEndian::read_u64(&rec[24..32]))?;
+    //if "PetGuardianBoardInfo" != s_name {
+    //   return Err(anyhow::Error::msg(""));
+    //}
+
     let u_size = LittleEndian::read_u64(&rec[32..40]);
     let u_flags = LittleEndian::read_u64(&rec[40..48]);
     let p_fields = LittleEndian::read_u64(&rec[48..56]);
     let field_cnt = LittleEndian::read_u32(&rec[56..60]) as usize;
 
-    let mut fields = read_fields(mem, p_fields, field_cnt)?;
+    let fields = read_fields(mem, p_fields, field_cnt)?;
+    //print!("{:?}\n", fields);
+    let mut fields = collapse_fields(fields);
+    //print!("{:?}\n", fields);
     fields.sort_by_key(|f| f.offset);
 
     //println!(
@@ -227,7 +235,48 @@ fn read_packet(mem: &Mem, entry: u64) -> Result<(u64, PacketInfo), anyhow::Error
         },
     ))
 }
+fn collapse_fields(fields: Vec<Field>) -> Vec<Field> {
+    let mut out = Vec::with_capacity(fields.len());
+    let mut i = 0;
 
+    while i < fields.len() {
+        let mut cur = fields[i].clone();
+
+        // ───────── 1 · UnderlyingType + Enum ────────────────────────────
+        if cur.name == "UnderlyingType" && i + 1 < fields.len() {
+            if let FieldType::Enum { ref mut repr, .. } = fields[i + 1].f_type.clone() {
+                // clone + modify, then push the decorated enum
+                let mut enum_field = fields[i + 1].clone();
+                if let FieldType::Enum { ref mut repr, .. } = enum_field.f_type {
+                    *repr = Some(Box::new(cur.f_type.clone()));
+                }
+                out.push(enum_field);
+                i += 2;
+                continue;
+            }
+        }
+
+        // ───────── 2 · Array header merges *backwards* ──────────────────
+        if matches!(cur.f_type, FieldType::Array(_))                     // it *is* a header
+            && !out.is_empty()
+            && out.last().unwrap().name == cur.name
+        // same logical field
+        {
+            // pop the element we just pushed and embed its type
+            let element = out.pop().unwrap();
+            cur.f_type = FieldType::Array(Box::new(element.f_type.clone()));
+            out.push(cur); // keep only header
+            i += 1;
+            continue;
+        }
+
+        // ───────── 3 · ordinary field ──────────────────────────────────
+        out.push(cur);
+        i += 1;
+    }
+
+    out
+}
 fn read_enum(mem: &Mem, entry: u64) -> Option<EnumDef> {
     // ---- quick pattern check -------------------------------------------
     let hdr = mem.read_bytes(entry, 56).ok()?; // 7×u64 = 56 bytes
@@ -295,54 +344,12 @@ fn read_fields(mem: &Mem, arr_ptr: u64, count: usize) -> anyhow::Result<Vec<Fiel
     while i >= 0 {
         // -------- read current record ------------------------------------
         let field_addr = LittleEndian::read_u64(&ptrs[(i as usize) * 8..][..8]);
-        let mut field = read_field(mem, field_addr)?;
+        let field = read_field(mem, field_addr)?;
 
-        // ===== CASE 1  •  UnderlyingType (must belong to an enum) ========
-        if field.name == "UnderlyingType" {
-            anyhow::ensure!(i > 0, "dangling UnderlyingType at index {}", i);
-
-            // peek the *preceding* record – must be an enum header
-            let prev_addr = LittleEndian::read_u64(&ptrs[(i as usize - 1) * 8..][..8]);
-            let mut enum_field = read_field(mem, prev_addr)?;
-
-            match &mut enum_field.f_type {
-                FieldType::Enum { repr, .. } => {
-                    *repr = Some(Box::new(field.f_type.clone()));
-                }
-                _ => anyhow::bail!(
-                    "UnderlyingType followed something that is not an enum @ index {}",
-                    i - 1
-                ),
-            }
-
-            out_rev.push(enum_field); // push *only* the decorated enum
-            i -= 2; // consumed the enum + helper
-            continue;
-        }
-
-        // ===== CASE 2  •  Element of an array (prev is the header) =======
-        if i > 0 {
-            let prev_addr = LittleEndian::read_u64(&ptrs[(i as usize - 1) * 8..][..8]);
-            let mut prev_field = read_field(mem, prev_addr)?;
-
-            if matches!(prev_field.f_type, FieldType::Array(_)) {
-                // merge: header becomes Array(<element-field-type>)
-                prev_field.f_type = FieldType::Array(Box::new(field.f_type.clone()));
-                out_rev.push(prev_field); // push merged entry
-                i -= 2; // consumed header + element
-                continue;
-            }
-        }
-
-        // ===== CASE 3  •  Ordinary field – just keep it ===================
         out_rev.push(field);
         i -= 1;
     }
 
-    // we built it backwards – flip to forward order…
-    out_rev.reverse();
-    // …and keep the “sorted by offset” guarantee
-    out_rev.sort_by_key(|f| f.offset);
     Ok(out_rev)
 }
 
@@ -391,12 +398,11 @@ fn clean_uobject_sym(sym: &str) -> String {
     // Compile lazily so we pay the cost only once.
     // Regex:  _Z\d+Z_Construct_U(ScriptStruct|Enum)_([^_]+_)?([A-Za-z0-9]+)v
     static RE_STRUCT: OnceLock<Regex> = OnceLock::new();
-    static RE_ENUM:   OnceLock<Regex> = OnceLock::new();
+    static RE_ENUM: OnceLock<Regex> = OnceLock::new();
 
     let struct_re = RE_STRUCT.get_or_init(|| {
         // _ZxxZ_Construct_UScriptStruct_<anything>v   →  capture 1 = full thing
-        Regex::new(r"^_Z\d+Z_Construct_UScriptStruct_([A-Za-z0-9_]+)v$")
-            .expect("struct regex")
+        Regex::new(r"^_Z\d+Z_Construct_UScriptStruct_([A-Za-z0-9_]+)v$").expect("struct regex")
     });
     if let Some(caps) = struct_re.captures(sym) {
         return caps[1].to_owned();
@@ -404,8 +410,7 @@ fn clean_uobject_sym(sym: &str) -> String {
 
     let enum_re = RE_ENUM.get_or_init(|| {
         // _ZxxZ_Construct_UEnum_<pkg>_<EnumName>v      →  capture 1 = EnumName
-        Regex::new(r"^_Z\d+Z_Construct_UEnum_[A-Za-z0-9]+_([A-Za-z0-9]+)v$")
-            .expect("enum regex")
+        Regex::new(r"^_Z\d+Z_Construct_UEnum_[A-Za-z0-9]+_([A-Za-z0-9]+)v$").expect("enum regex")
     });
     if let Some(caps) = enum_re.captures(sym) {
         return caps[1].to_owned();
@@ -434,21 +439,17 @@ fn read_field(mem: &Mem, field_addr: u64) -> anyhow::Result<Field> {
     let name = mem.get_ascii_string(s_name)?;
 
     let (offset, ty_name_opt) = match f_type {
-            25 | 30 => {
-                // look up symbol → clean it
-                let ty_name = mem
-                    .addr2name
-                    .get(&func_desc)
-                    .clone()
-                    ;
-                (raw_offset, ty_name)
-            }
-            44 => {
-                let off = arm64_store_imm(mem, func_desc1 + 4).unwrap_or(0);
-                (off, None)
-            }
-            _ => (raw_offset, None),
-        };
+        25 | 30 => {
+            // look up symbol → clean it
+            let ty_name = mem.addr2name.get(&func_desc).clone();
+            (raw_offset, ty_name)
+        }
+        44 => {
+            let off = arm64_store_imm(mem, func_desc1 + 4).unwrap_or(0);
+            (off, None)
+        }
+        _ => (raw_offset, None),
+    };
 
     let f_type = to_field_type(f_type, ty_name_opt.cloned());
 
@@ -593,16 +594,27 @@ fn main() -> Result<(), anyhow::Error> {
     //let src = generate_rust(&packets);
     //std::fs::write("packets.rs", src)?;
 
-    let ex = generate_elixir(&packets, "Proto.Packets");
-    std::fs::write("packets.ex", ex)?;
+    let _ = fs::create_dir_all("out");
 
-    let ex = generate_elixir(&structs, "Proto.Structs");
-    std::fs::write("structs.ex", ex)?;
+    packets.extend(structs);
+
+    let parts = 64usize.max(1); // never 0
+    let per_part = (packets.len() + parts - 1) / parts; // ceil div
+
+    for (idx, chunk) in packets.chunks(per_part).enumerate() {
+        if chunk.is_empty() {
+            break;
+        } // fewer than 64 groups
+
+        let fname = format!("out/packets_{:02}.ex", idx); // packets_00.ex … _63.ex
+        let body = generate_elixir_chunk(chunk);
+        std::fs::write(&fname, body)?;
+    }
 
     Ok(())
 }
 
-use std::fmt::Write;
+//use std::fmt::Write;
 
 fn elixir_atom(src: &str) -> String {
     let mut out = String::with_capacity(src.len() + 4);
@@ -622,23 +634,24 @@ fn elixir_atom(src: &str) -> String {
 fn elixir_type(ft: &FieldType) -> String {
     use FieldType::*;
     match ft {
-        U8            => ":u8".into(),
-        I32           => ":i32".into(),
-        I64           => ":i64".into(),
-        F32           => ":f32".into(),
-        StringUtf16   => ":string_utf16".into(),
-        Bool          => ":bool".into(),
+        U8 => ":u8".into(),
+        I32 => ":i32".into(),
+        I64 => ":i64".into(),
+        F32 => ":f32".into(),
+        StringUtf16 => ":string_utf16".into(),
+        Bool => ":bool".into(),
 
-        Array(elem)   => format!("list({})", elixir_type(elem)),
-        Struct(raw)  => format!("PacketDSL.struct({})", clean_uobject_sym(raw)),
+        Array(elem) => format!("list({})", elixir_type(elem)),
+        Struct(raw) => format!("PacketDSL.struct({})", clean_uobject_sym(raw)),
         Enum { name, .. } => format!("PacketDSL.enum({})", clean_uobject_sym(name)),
 
-        Unresolved    => ":unresolved".into(),
+        Unresolved => ":unresolved".into(),
         Unknown(code) => format!("PacketDSL.unknown({})", code),
     }
 }
 
 /// Generate Elixir code that uses PacketDSL.
+/*
 fn generate_elixir(packets: &[PacketInfo], module_name: &str) -> String {
     let mut out = String::with_capacity(4096);
 
@@ -669,5 +682,33 @@ fn generate_elixir(packets: &[PacketInfo], module_name: &str) -> String {
 
     // ── footer ───────────────────────────────────────────────────────────
     out.push_str("end\n");
+    out
+}
+*/
+fn generate_elixir_chunk(packets: &[PacketInfo]) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::with_capacity(2048);
+
+    // file header
+    writeln!(out, "# Auto-generated: DO NOT EDIT").unwrap();
+    writeln!(out, "import PacketDSL\n").unwrap();
+
+    // every packet
+    for pkt in packets {
+        writeln!(out, "packet {} do", pkt.name).unwrap();
+        for f in &pkt.fields {
+            writeln!(
+                out,
+                "  field :{:<25}, {} # offset 0x{:X}",
+                elixir_atom(&f.name),
+                elixir_type(&f.f_type),
+                f.offset
+            )
+            .unwrap();
+        }
+        writeln!(out, "end\n").unwrap();
+    }
+
     out
 }
